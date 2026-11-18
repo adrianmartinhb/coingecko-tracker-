@@ -122,42 +122,55 @@ def send_webhook(webhook_url: str, content: str):
         print(f"[!] Failed to send webhook notification: {e}", file=sys.stderr)
 
 
-def get_telegram_chat_id(bot_token: str) -> str:
-    """Auto-detect the user's Telegram chat_id from the latest message sent to the bot."""
+def get_telegram_chat_ids(bot_token: str) -> List[str]:
+    """Auto-detect all Telegram chat_ids that have messaged the bot."""
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
     data = fetch_json(url)
+    found = []
     if data and data.get("ok") and data.get("result"):
-        for update in reversed(data["result"]):
+        for update in data["result"]:
             msg = update.get("message") or update.get("channel_post") or {}
             chat = msg.get("chat") or {}
             if "id" in chat:
-                return str(chat["id"])
-    return None
+                cid = str(chat["id"])
+                if cid not in found:
+                    found.append(cid)
+    return found
+
+
+def get_telegram_chat_id(bot_token: str) -> str:
+    """Return comma-separated list of all detected chat_ids."""
+    ids = get_telegram_chat_ids(bot_token)
+    return ",".join(ids) if ids else None
 
 
 def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
-    """Send a formatted message via Telegram Bot API."""
+    """Send a formatted message via Telegram Bot API to one or more comma-separated chat_ids."""
     if not bot_token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "CoinGeckoVolumeTracker/1.0"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[!] Failed to send Telegram notification: {e}", file=sys.stderr)
-        return False
+    chat_ids = [c.strip() for c in str(chat_id).split(",") if c.strip()]
+    any_ok = False
+    for cid in chat_ids:
+        payload = json.dumps({
+            "chat_id": cid,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "CoinGeckoVolumeTracker/1.0"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    any_ok = True
+        except Exception as e:
+            print(f"[!] Failed to send Telegram notification to {cid}: {e}", file=sys.stderr)
+    return any_ok
 
 
 def load_config() -> Dict[str, str]:
@@ -268,20 +281,34 @@ def format_currency(val: float) -> str:
     return f"${val:.6f}"
 
 
-def run_check(args, seen_coins: Dict[str, float]) -> Tuple[List[Dict], Dict[str, float]]:
-    if args.telegram_token and not args.telegram_chat_id:
-        detected_id = get_telegram_chat_id(args.telegram_token)
-        if detected_id:
-            args.telegram_chat_id = detected_id
+def run_check(args, seen_coins: Dict[str, any]) -> Tuple[List[Dict], Dict[str, any]]:
+    newly_added_chat_ids = []
+    if args.telegram_token:
+        existing_ids = [c.strip() for c in str(args.telegram_chat_id or "").split(",") if c.strip()]
+        saved_ids = seen_coins.get("_chat_ids", []) if isinstance(seen_coins.get("_chat_ids"), list) else []
+        for sid in saved_ids:
+            if str(sid) not in existing_ids:
+                existing_ids.append(str(sid))
+
+        detected_ids = get_telegram_chat_ids(args.telegram_token)
+        for did in detected_ids:
+            if did not in existing_ids:
+                existing_ids.append(did)
+                newly_added_chat_ids.append(did)
+                print(f"[+] Connected new Telegram Chat ID: {did}")
+                send_telegram(
+                    args.telegram_token,
+                    did,
+                    "✅ <b>CoinGecko Volume Spike Bot Connected!</b>\nMonitoring Top Gainers for volume spikes..."
+                )
+
+        if existing_ids:
+            args.telegram_chat_id = ",".join(existing_ids)
+            seen_coins["_chat_ids"] = existing_ids
             cfg = load_config()
-            cfg["telegram_chat_id"] = detected_id
-            save_config(cfg)
-            print(f"[+] Connected to Telegram Chat ID: {detected_id}")
-            send_telegram(
-                args.telegram_token,
-                args.telegram_chat_id,
-                "✅ <b>CoinGecko Volume Spike Bot Connected!</b>\nMonitoring Top Gainers for volume spikes..."
-            )
+            if cfg.get("telegram_chat_id") != args.telegram_chat_id:
+                cfg["telegram_chat_id"] = args.telegram_chat_id
+                save_config(cfg)
 
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scanning CoinGecko for Top Gainers with Volume Spikes...")
 
@@ -359,6 +386,19 @@ def run_check(args, seen_coins: Dict[str, float]) -> Tuple[List[Dict], Dict[str,
                     f"🔗 <a href=\"{c['url']}\">View on CoinGecko</a>"
                 )
                 send_telegram(args.telegram_token, args.telegram_chat_id, tg_html)
+    elif newly_added_chat_ids and alerts and args.telegram_token:
+        new_targets = ",".join(newly_added_chat_ids)
+        for c in alerts:
+            c1h_str = f"{c['change_1h']:+.1f}%" if c['change_1h'] is not None else "N/A"
+            tg_html = (
+                f"🚀 <b>{c['symbol']} ({c['name']})</b> — #{c['gainer_rank']} Top Gainer\n"
+                f"💰 <b>Price:</b> {format_currency(c['price'])}\n"
+                f"📈 <b>24h Change:</b> +{c['change_24h']:.1f}% (1h: {c1h_str})\n"
+                f"📊 <b>24h Volume:</b> {format_currency(c['volume_24h'])}\n"
+                f"🏦 <b>Market Cap:</b> {format_currency(c['market_cap'])} (Vol/MCap: {c['vol_mcap_ratio']*100:.0f}%)\n"
+                f"🔗 <a href=\"{c['url']}\">View on CoinGecko</a>"
+            )
+            send_telegram(args.telegram_token, new_targets, tg_html)
 
     save_seen_coins(seen_coins)
     return alerts, seen_coins
