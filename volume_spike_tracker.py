@@ -66,10 +66,11 @@ def get_top_gainers_via_pro_endpoint(api_key: str, is_pro: bool) -> List[Dict]:
     return []
 
 
-def get_markets_data(api_key: str = None, is_pro: bool = False, pages: int = 2) -> List[Dict]:
+def get_markets_data(api_key: str = None, is_pro: bool = False, pages: int = 4) -> List[Dict]:
     """
     Fetch market data (price, 24h volume, market cap, 24h price change) from the
-    public /coins/markets endpoint.
+    public /coins/markets endpoint for the Top 1,000 coins by Market Cap (matching
+    CoinGecko's Top Gainers page pool).
     """
     base = PRO_BASE_URL if is_pro else COINGECKO_BASE_URL
     all_coins = []
@@ -77,7 +78,7 @@ def get_markets_data(api_key: str = None, is_pro: bool = False, pages: int = 2) 
     for page in range(1, pages + 1):
         params = urllib.parse.urlencode({
             "vs_currency": "usd",
-            "order": "volume_desc",
+            "order": "market_cap_desc",
             "per_page": 250,
             "page": page,
             "sparkline": "false",
@@ -89,7 +90,7 @@ def get_markets_data(api_key: str = None, is_pro: bool = False, pages: int = 2) 
             break
         all_coins.extend(data)
         if page < pages:
-            time.sleep(1.5)  # Respect public rate limits
+            time.sleep(2.0)  # Respect public rate limits across 4 pages
 
     return all_coins
 
@@ -212,9 +213,9 @@ def save_seen_coins(seen: Dict[str, float]):
 def analyze_coins(
     coins: List[Dict],
     top_gainers_limit: int = 30,
-    min_price_gain: float = 15.0,
-    min_vol_mcap_ratio: float = 0.25,
-    min_volume_usd: float = 5_000_000,
+    min_price_gain: float = 10.0,
+    min_vol_mcap_ratio: float = 0.10,
+    min_volume_usd: float = 1_000_000,
 ) -> List[Dict]:
     """
     Filter and rank coins that are both:
@@ -409,11 +410,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Monitor CoinGecko for Top Gainers experiencing volume spikes."
     )
-    parser.add_argument("--min-gain", type=float, default=15.0, help="Minimum 24h price gain percentage (default: 15.0)")
-    parser.add_argument("--min-vol-ratio", type=float, default=0.25, help="Minimum 24h Volume / Market Cap ratio (default: 0.25 = 25%%)")
-    parser.add_argument("--min-volume", type=float, default=5_000_000, help="Minimum 24h USD trading volume (default: $5,000,000)")
+    parser.add_argument("--min-gain", type=float, default=10.0, help="Minimum 24h price gain percentage (default: 10.0)")
+    parser.add_argument("--min-vol-ratio", type=float, default=0.10, help="Minimum 24h Volume / Market Cap ratio (default: 0.10 = 10%%)")
+    parser.add_argument("--min-volume", type=float, default=1_000_000, help="Minimum 24h USD trading volume (default: $1,000,000)")
     parser.add_argument("--top-n", type=int, default=30, help="Check coins within the top N gainers (default: 30)")
-    parser.add_argument("--pages", type=int, default=2, help="Number of 250-coin pages to fetch by volume (default: 2 = top 500 coins)")
+    parser.add_argument("--pages", type=int, default=4, help="Number of 250-coin pages to fetch by market cap (default: 4 = top 1000 coins)")
     parser.add_argument("--interval", type=int, default=0, help="Poll interval in seconds. Set > 0 (e.g. 300) for continuous monitoring.")
     parser.add_argument("--cooldown", type=float, default=6.0, help="Hours before re-alerting on the same coin (default: 6)")
     parser.add_argument("--webhook", type=str, default=os.environ.get("CG_WEBHOOK_URL") or cfg.get("webhook"), help="Discord/Slack webhook URL for notifications")
