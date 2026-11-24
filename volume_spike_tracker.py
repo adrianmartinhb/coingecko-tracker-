@@ -4,6 +4,7 @@ CoinGecko Volume Spike & Top Gainers Tracker
 """
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -12,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Set, Tuple
 
 # Default configuration
@@ -20,6 +21,7 @@ COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 PRO_BASE_URL = "https://pro-api.coingecko.com/api/v3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_COINS_FILE = os.path.join(BASE_DIR, "seen_alerts.json")
+ALERTS_CSV_FILE = os.path.join(BASE_DIR, "alerts_history.csv")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
 
@@ -210,6 +212,76 @@ def save_seen_coins(seen: Dict[str, float]):
         print(f"[!] Could not save seen alerts: {e}", file=sys.stderr)
 
 
+def log_alerts_to_spreadsheet(new_alerts: List[Dict], sheet_webhook_url: str = None):
+    """
+    Append newly alerted coins to alerts_history.csv (for Excel / Google Sheets IMPORTDATA)
+    and optionally push them directly to a Google Sheets Apps Script Web App URL.
+    """
+    if not new_alerts:
+        return
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    headers = [
+        "Date / Time (UTC)",
+        "Top Gainer Rank",
+        "Crypto",
+        "Symbol",
+        "Price (USD)",
+        "1h Change (%)",
+        "24h Change (%)",
+        "24h Volume (USD)",
+        "Market Cap (USD)",
+        "Vol / MCap (%)",
+        "CoinGecko URL",
+    ]
+
+    file_exists = os.path.exists(ALERTS_CSV_FILE) and os.path.getsize(ALERTS_CSV_FILE) > 0
+    rows_to_add = []
+    for c in new_alerts:
+        c1h_val = f"{c['change_1h']:+.2f}%" if c.get("change_1h") is not None else "N/A"
+        c24h_val = f"{c['change_24h']:+.2f}%"
+        vol_mcap_pct = f"{c['vol_mcap_ratio'] * 100:.1f}%" if c.get("market_cap", 0) > 0 else "N/A"
+        row = [
+            now_str,
+            f"#{c['gainer_rank']}",
+            f"{c['name']} ({c['symbol']})",
+            c["symbol"],
+            c["price"],
+            c1h_val,
+            c24h_val,
+            round(c["volume_24h"], 2),
+            round(c["market_cap"], 2),
+            vol_mcap_pct,
+            c["url"],
+        ]
+        rows_to_add.append(row)
+
+    try:
+        with open(ALERTS_CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(headers)
+            writer.writerows(rows_to_add)
+        print(f"[+] Logged {len(rows_to_add)} alert(s) to {ALERTS_CSV_FILE}")
+    except Exception as e:
+        print(f"[!] Failed to write to {ALERTS_CSV_FILE}: {e}", file=sys.stderr)
+
+    if sheet_webhook_url:
+        payload = json.dumps({"headers": headers, "rows": rows_to_add}).encode("utf-8")
+        req = urllib.request.Request(
+            sheet_webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "CoinGeckoVolumeTracker/1.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if 200 <= resp.status < 400:
+                    print(f"[+] Appended {len(rows_to_add)} row(s) to Google Sheet via webhook.")
+        except Exception as e:
+            print(f"[!] Failed to append to Google Sheet webhook: {e}", file=sys.stderr)
+
+
 def analyze_coins(
     coins: List[Dict],
     top_gainers_limit: int = 30,
@@ -366,6 +438,7 @@ def run_check(args, seen_coins: Dict[str, any]) -> Tuple[List[Dict], Dict[str, a
     print("-" * len(header))
 
     if new_alerts:
+        log_alerts_to_spreadsheet(new_alerts, getattr(args, "sheet_webhook", None))
         for c in new_alerts:
             msg = (
                 f"🚀 {c['symbol']} ({c['name']}) is #{c['gainer_rank']} on Top Gainers! "
@@ -387,19 +460,23 @@ def run_check(args, seen_coins: Dict[str, any]) -> Tuple[List[Dict], Dict[str, a
                     f"🔗 <a href=\"{c['url']}\">View on CoinGecko</a>"
                 )
                 send_telegram(args.telegram_token, args.telegram_chat_id, tg_html)
-    elif newly_added_chat_ids and alerts and args.telegram_token:
-        new_targets = ",".join(newly_added_chat_ids)
-        for c in alerts:
-            c1h_str = f"{c['change_1h']:+.1f}%" if c['change_1h'] is not None else "N/A"
-            tg_html = (
-                f"🚀 <b>{c['symbol']} ({c['name']})</b> — #{c['gainer_rank']} Top Gainer\n"
-                f"💰 <b>Price:</b> {format_currency(c['price'])}\n"
-                f"📈 <b>24h Change:</b> +{c['change_24h']:.1f}% (1h: {c1h_str})\n"
-                f"📊 <b>24h Volume:</b> {format_currency(c['volume_24h'])}\n"
-                f"🏦 <b>Market Cap:</b> {format_currency(c['market_cap'])} (Vol/MCap: {c['vol_mcap_ratio']*100:.0f}%)\n"
-                f"🔗 <a href=\"{c['url']}\">View on CoinGecko</a>"
-            )
-            send_telegram(args.telegram_token, new_targets, tg_html)
+    else:
+        if alerts and not os.path.exists(ALERTS_CSV_FILE):
+            # Seed initial CSV with currently active alerts if CSV doesn't exist yet
+            log_alerts_to_spreadsheet(alerts, getattr(args, "sheet_webhook", None))
+        if newly_added_chat_ids and alerts and args.telegram_token:
+            new_targets = ",".join(newly_added_chat_ids)
+            for c in alerts:
+                c1h_str = f"{c['change_1h']:+.1f}%" if c['change_1h'] is not None else "N/A"
+                tg_html = (
+                    f"🚀 <b>{c['symbol']} ({c['name']})</b> — #{c['gainer_rank']} Top Gainer\n"
+                    f"💰 <b>Price:</b> {format_currency(c['price'])}\n"
+                    f"📈 <b>24h Change:</b> +{c['change_24h']:.1f}% (1h: {c1h_str})\n"
+                    f"📊 <b>24h Volume:</b> {format_currency(c['volume_24h'])}\n"
+                    f"🏦 <b>Market Cap:</b> {format_currency(c['market_cap'])} (Vol/MCap: {c['vol_mcap_ratio']*100:.0f}%)\n"
+                    f"🔗 <a href=\"{c['url']}\">View on CoinGecko</a>"
+                )
+                send_telegram(args.telegram_token, new_targets, tg_html)
 
     save_seen_coins(seen_coins)
     return alerts, seen_coins
@@ -418,6 +495,7 @@ def main():
     parser.add_argument("--interval", type=int, default=0, help="Poll interval in seconds. Set > 0 (e.g. 300) for continuous monitoring.")
     parser.add_argument("--cooldown", type=float, default=6.0, help="Hours before re-alerting on the same coin (default: 6)")
     parser.add_argument("--webhook", type=str, default=os.environ.get("CG_WEBHOOK_URL") or cfg.get("webhook"), help="Discord/Slack webhook URL for notifications")
+    parser.add_argument("--sheet-webhook", type=str, default=os.environ.get("GOOGLE_SHEET_WEBHOOK_URL") or cfg.get("sheet_webhook"), help="Google Sheets Apps Script Web App URL for logging alerts")
     parser.add_argument("--telegram-token", type=str, default=os.environ.get("TELEGRAM_BOT_TOKEN") or cfg.get("telegram_token"), help="Telegram Bot Token from @BotFather")
     parser.add_argument("--telegram-chat-id", type=str, default=os.environ.get("TELEGRAM_CHAT_ID") or cfg.get("telegram_chat_id"), help="Telegram Chat ID (auto-detected if omitted after messaging your bot)")
     parser.add_argument("--test-telegram", action="store_true", help="Send a test alert to your Telegram bot and exit")
@@ -440,7 +518,7 @@ def main():
 
     # Save credentials to config.json so the user doesn't have to re-type them next time
     updated_cfg = False
-    for key in ("telegram_token", "telegram_chat_id", "webhook", "api_key"):
+    for key in ("telegram_token", "telegram_chat_id", "webhook", "sheet_webhook", "api_key"):
         val = getattr(args, key, None)
         if val and cfg.get(key) != val:
             cfg[key] = val
